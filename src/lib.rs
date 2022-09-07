@@ -1,20 +1,16 @@
 use chrono::Utc;
-use log::{error, info, trace};
+use log::{info, trace};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fmt::Error;
-use std::fmt::{self, write};
 use std::sync::Arc;
 use std::sync::Mutex;
+
 const DIFFICULTY: &str = "00";
 const GENESIS_BLOCK_DATA: &str = "genesis block";
 const GENESIS_BLOCK_HASH: &str = "0A31F6A1DB36EEDF9AA5C56AB90DCC76A3ABD90C77B1198336FD1AE512193F";
 
-fn error_chain_fmt(
-    e: &impl std::error::Error,
-    f: &mut std::fmt::Formatter<'_>,
-) -> std::fmt::Result {
+fn error_chain_fmt(e: &dyn std::error::Error, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     writeln!(f, "{}\n", e)?;
     let mut current = e.source();
     while let Some(cause) = current {
@@ -26,7 +22,7 @@ fn error_chain_fmt(
 
 pub enum BlockchainError {
     BlockInvalid(String),
-    ChainInvalid,
+    ChainInvalid(Box<BlockchainError>),
     BlockNotFound(String),
     MiscError(Box<dyn std::error::Error>),
     Error(String),
@@ -35,7 +31,7 @@ pub enum BlockchainError {
 impl std::fmt::Display for BlockchainError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            BlockchainError::ChainInvalid => {
+            BlockchainError::ChainInvalid(_) => {
                 write!(f, "blockchain invalid.")
             }
             BlockchainError::BlockInvalid(hash) => {
@@ -45,7 +41,7 @@ impl std::fmt::Display for BlockchainError {
                 write!(f, "block not found: {}", hash)
             }
             BlockchainError::Error(err) => {
-                write!(f, "blockchain error: {}", err)
+                write!(f, "error: {}", err)
             }
             BlockchainError::MiscError(ref err) => err.fmt(f),
         }
@@ -55,7 +51,7 @@ impl std::fmt::Display for BlockchainError {
 impl std::error::Error for BlockchainError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            BlockchainError::ChainInvalid => None,
+            BlockchainError::ChainInvalid(err) => Some(err),
             BlockchainError::BlockInvalid(_) => None,
             BlockchainError::BlockNotFound(_) => None,
             BlockchainError::MiscError(_) => None,
@@ -65,9 +61,9 @@ impl std::error::Error for BlockchainError {
 }
 
 impl std::fmt::Debug for BlockchainError {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result { 
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         error_chain_fmt(&self, fmt)
-     }
+    }
 }
 
 // impl From<std::fmt::Error> for BlockchainError {
@@ -76,11 +72,11 @@ impl std::fmt::Debug for BlockchainError {
 //     }
 // }
 
-impl From<String> for BlockchainError {
-    fn from(err: String) -> Self {
-        Self::Error(err)
-    }
-}
+// impl From<String> for BlockchainError {
+//     fn from(err: String) -> Self {
+//         Self::Error(err)
+//     }
+// }
 
 #[derive(Serialize, Debug, Deserialize, Clone)]
 pub struct Chain {
@@ -134,7 +130,10 @@ impl Chain {
         }
 
         let block_hash = hasher(&block.prev_hash, &block.data, block.timestamp, block.nonce);
-        let get_block = self.blocks.get(&block_hash).ok_or(BlockchainError::BlockNotFound(block.prev_hash.to_owned()))?;
+        let get_block = self
+            .blocks
+            .get(&block_hash)
+            .ok_or(BlockchainError::BlockNotFound(block.prev_hash.to_owned()))?;
 
         if block_hash != block.hash || get_block.id != block.id {
             return Err(BlockchainError::BlockInvalid(block.hash.to_owned()));
@@ -143,14 +142,18 @@ impl Chain {
         Ok(())
     }
 
+    #[tracing::instrument(
+        name = "Validating chain"
+    )]
     pub fn validate_chain(&self) -> Result<(), BlockchainError> {
-        let latest_block = self.blocks.get(&self.latest_block).unwrap();
+        let latest_block = self.get_block(&self.latest_block).ok_or(BlockchainError::ChainInvalid(Box::new(BlockchainError::BlockNotFound(self.latest_block.to_owned()))))?;
         // let latest_block_valid = self.check_if_block_valid(&latest_block);
         // if self.blocks.len() == 1 {
         //     return latest_block_valid;
         // }
         let mut current_block_hash = &latest_block.hash;
-        let mut blocks_validated = 0;
+        // genesis block is always valid
+        let mut blocks_validated = 1;
         loop {
             let current_block =
                 self.blocks
@@ -162,14 +165,17 @@ impl Chain {
                 if blocks_validated == self.blocks.len() {
                     return Ok(());
                 } else {
-                    return Err(BlockchainError::ChainInvalid);
+                    return Err(BlockchainError::ChainInvalid(Box::new(
+                        BlockchainError::Error("invalid chain length.".to_owned()),
+                    )));
                 }
             }
+
             match self.check_if_block_valid(current_block) {
                 Ok(()) => {
                     current_block_hash = &current_block.prev_hash;
                 }
-                Err(err) => return Err(BlockchainError::ChainInvalid),
+                Err(err) => return Err(BlockchainError::ChainInvalid(Box::new(err))),
             }
             blocks_validated += 1;
         }
@@ -190,7 +196,7 @@ impl Block {
     pub fn new(prev_block: &Block, data: String) -> Self {
         let timestamp = Utc::now().timestamp();
         let threads = num_cpus::get();
-        println!("Mining...");
+
         let (hash, nonce) = find_hash(&prev_block.hash, &data, timestamp, DIFFICULTY, threads);
         Self {
             id: prev_block.id + 1,
