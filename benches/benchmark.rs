@@ -32,15 +32,15 @@ test test_hashing_sync ... bench: 961,240,210 ns/iter (+/- 102,724,215)
 
 */
 
-// #[bench]
-// fn test_hashing_single_thread(b: &mut Bencher) {
-//     b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", 1 as usize));
-// }
+#[bench]
+fn test_hashing_single_thread(b: &mut Bencher) {
+    b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", 1 as usize));
+}
 
-// #[bench]
-// fn test_hashing_two_threads(b: &mut Bencher) {
-//     b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", 2 as usize));
-// }
+#[bench]
+fn test_hashing_two_threads(b: &mut Bencher) {
+    b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", 2 as usize));
+}
 
 #[bench]
 fn test_hashing_multithreaded(b: &mut Bencher) {
@@ -48,7 +48,7 @@ fn test_hashing_multithreaded(b: &mut Bencher) {
     b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", threads));
 }
 
-// #[bench]
-// fn test_hashing_sync(b: &mut Bencher) {
-//     b.iter(|| rust_blockchain::find_hash_sync("prev_hash", "data", 1234545678, "00"));
-// }
+#[bench]
+fn test_hashing_sync(b: &mut Bencher) {
+    b.iter(|| rust_blockchain::find_hash_sync("prev_hash", "data", 1234545678, "00"));
+}

@@ -1,3 +1,5 @@
+pub mod p2p;
+
 use chrono::Utc;
 use log::{info, trace};
 use serde::{Deserialize, Serialize};
@@ -196,7 +198,7 @@ impl Block {
     pub fn new(prev_block: &Block, data: String) -> Self {
         let timestamp = Utc::now().timestamp();
         let threads = num_cpus::get();
-
+        println!("threads: {}", threads);
         let (hash, nonce) = find_hash(&prev_block.hash, &data, timestamp, DIFFICULTY, threads);
         Self {
             id: prev_block.id + 1,
@@ -247,7 +249,7 @@ pub fn find_hash(
                 Arc::clone(&hash),
                 Arc::clone(&final_nonce),
             );
-            s.spawn(move |_| 'looop: loop {
+            s.spawn(move |_| loop {
                 let mut shared_max_nonce = shared_max_nonce.lock().unwrap();
                 let start_nonce = shared_max_nonce.clone();
                 let end_nonce = start_nonce.clone() + 100;
@@ -265,7 +267,7 @@ pub fn find_hash(
                     break;
                 }
                 if *final_nonce.lock().unwrap() != 0 {
-                    break 'looop;
+                    break;
                 }
             });
         }

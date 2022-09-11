@@ -1,12 +1,10 @@
+use rust_blockchain::{p2p, BlockchainError, Chain};
 use std::error::Error;
-use rust_blockchain::{Block, BlockchainError, Chain};
-use tracing::{error, info, Level};
+use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
-use libp2p::{identity, PeerId};
 
-#[async_std::main]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::TRACE)
         .finish();
@@ -14,11 +12,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("starting app");
 
-    // Create network identity for node
-    let local_key = identity::Keypair::generate_ed25519();
-    let local_peer_id = PeerId::from(local_key.public());
-    info!("Local PeerId: {:?}", local_peer_id);
+    let p2p_task = tokio::spawn(p2p::init_p2p());
+    let app_task = tokio::spawn(run());
 
+    tokio::select! {
+        res = p2p_task => info!("p2p exited {:?}", res),
+        res = app_task => info!("app exited {:?}", res),
+    };
+
+    Ok(())
+}
+
+async fn run() -> Result<(), std::fmt::Error> {
+    // async fn run() -> Option<String> {
     let mut chain = Chain::new();
 
     println!("---------------------------");
@@ -29,7 +35,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("chain validate");
     println!("exit");
     println!("---------------------------");
-
     loop {
         let mut user_input = String::new();
         println!("---------------------------");
