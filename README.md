@@ -1,21 +1,27 @@
 # Rust Blockchain
 
+## 
+
+Open up at least two terminals and run `dasdasd`
+
+Nodes should auto connect within seconds after startup. Try disabling any active VPN connections if this is not the case.
 
 
 
-Inspired by
+
+## Inspired by
 
 https://github.com/zupzup/rust-blockchain-example
 
-Resources
+## Resources
 
-libp2p
+### libp2p
 
 https://github.com/libp2p/rust-libp2p
 
 https://github.com/Frederik-Baetens/libp2p-tokiochat/blob/main/src/main.rs
 
-Kademlia
+### Kademlia
 
 https://github.com/libp2p/specs/blob/master/kad-dht/README.md
 
@@ -27,9 +33,9 @@ https://codethechange.stanford.edu/guides/guide_kademlia.html
 
 
 ## Linking
-The project uses **lld** by LLVM for faster linking (under Windows), which means faster (incremental) compilation. 
+The project uses **lld** by LLVM (available for Windows) for faster linking, which means faster (incremental) compilation. 
 
-https://github.com/rui314/mold would be an even faster alternative (only available for Linux and iOS though)
+https://github.com/rui314/mold would be an even faster alternative (available for Linux and iOS)
 
 
 ## Mining

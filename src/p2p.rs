@@ -1,30 +1,42 @@
-use async_std::io;
 use futures::{prelude::*, select};
-use libp2p::{gossipsub, identity, swarm::{SwarmEvent, dial_opts::{DialOpts, PeerCondition}, NetworkBehaviour}, Multiaddr, PeerId, identify::{Identify, IdentifyEvent}, kad::{Kademlia, store::MemoryStore, KademliaEvent}, NetworkBehaviour};
-
-use libp2p::gossipsub::{
-    GossipsubEvent, GossipsubMessage, IdentTopic as Topic, MessageAuthenticity, MessageId,
-    ValidationMode, Gossipsub,
+use libp2p::{
+    core::transport::upgrade,
+    gossipsub::{
+        Gossipsub, GossipsubConfigBuilder, GossipsubEvent, GossipsubMessage, IdentTopic as Topic,
+        MessageAuthenticity, MessageId, ValidationMode,
+    },
+    identity,
+    mdns::{MdnsEvent, TokioMdns},
+    mplex, noise,
+    swarm::{
+        dial_opts::{DialOpts, PeerCondition},
+        SwarmBuilder, SwarmEvent,
+    },
+    tcp::{GenTcpConfig, TokioTcpTransport},
+    Multiaddr, NetworkBehaviour, PeerId, Swarm, Transport,
 };
 use once_cell::sync::Lazy;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use tokio::io::{self, AsyncBufReadExt};
+use tracing::{info, Level};
 
+// Generate local keypair
 static LOCAL_KEY: Lazy<identity::Keypair> = Lazy::new(identity::Keypair::generate_ed25519);
 static LOCAL_PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(LOCAL_KEY.public()));
+// Create a gossipsub topic
+static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("blockchain"));
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NetworkEvent")]
 struct BlockchainBehavior {
     gossipsub: Gossipsub,
-    kademlia: Kademlia<MemoryStore>,
-    identify: Identify
+    mdns: TokioMdns,
 }
 
 enum NetworkEvent {
     Gossipsub(GossipsubEvent),
-    Kademlia(KademliaEvent),
-    Identify(IdentifyEvent)
+    TokioMdns(MdnsEvent),
 }
 
 impl From<GossipsubEvent> for NetworkEvent {
@@ -33,114 +45,217 @@ impl From<GossipsubEvent> for NetworkEvent {
     }
 }
 
-impl From<KademliaEvent> for NetworkEvent {
-    fn from(event: KademliaEvent) -> Self {
-        Self::Kademlia(event)
-    }
-}
-
-impl From<IdentifyEvent> for NetworkEvent {
-    fn from(event: IdentifyEvent) -> Self {
-        Self::Identify(event)
+impl From<MdnsEvent> for NetworkEvent {
+    fn from(event: MdnsEvent) -> Self {
+        Self::TokioMdns(event)
     }
 }
 
 pub async fn init_p2p() -> Result<(), std::io::Error> {
     println!("Local PeerId: {:?}", LOCAL_PEER_ID.clone());
 
-    // Set up encrypted TCP Transport over Mplex and Yamux protocols
-    let transport = libp2p::development_transport(LOCAL_KEY.clone()).await?;
+    // We manually keep track of all currently connected gossipsub peers
+    // in order to keep the borrow checker happy (otherwise we would need
+    // acces to both the gossipsub and mdns behaviours at the same time)
+    let mut gossipsub_peers: HashSet<PeerId> = HashSet::<PeerId>::new();
 
-    // Create a gossipsub topic
-    let topic = Topic::new("blockchain");
+    // Create a keypair for authenticated encryption of the transport.
+    let noise_keys = noise::Keypair::<noise::X25519Spec>::new()
+        .into_authentic(&LOCAL_KEY)
+        .expect("Signing libp2p-noise static DH keypair failed.");
+
+    // Create a tokio-based TCP transport use noise for authenticated
+    // encryption and Mplex for multiplexing of substreams on a TCP stream.
+    let transport = TokioTcpTransport::new(GenTcpConfig::default().nodelay(true))
+        .upgrade(upgrade::Version::V1)
+        .authenticate(noise::NoiseConfig::xx(noise_keys).into_authenticated())
+        .multiplex(mplex::MplexConfig::new())
+        .boxed();
 
     // Create a swarm to manage peers and events
     let mut swarm = {
-        // To content-address message, we can take the hash of message and use it as an ID.
-        let message_id_fn = |message: &GossipsubMessage| {
-            let mut s = DefaultHasher::new();
-            message.data.hash(&mut s);
-            MessageId::from(s.finish().to_string())
+        let mut blockchain_behavior = BlockchainBehavior {
+            gossipsub: build_gossipsub_behavior(),
+            mdns: TokioMdns::new(Default::default())
+                .await
+                .expect("can create mdns"),
         };
 
-        // Set a custom gossip
-        let gossipsub_config = gossipsub::GossipsubConfigBuilder::default()
-            .validation_mode(ValidationMode::Strict)
-            .message_id_fn(message_id_fn)
+        SwarmBuilder::new(transport, blockchain_behavior, LOCAL_PEER_ID.clone())
+            // We want the connection background tasks to be spawned
+            // onto the tokio runtime.
+            .executor(Box::new(|fut| {
+                tokio::spawn(fut);
+            }))
             .build()
-            .expect("valid config");
-
-        // Build a gossipsub network behavior
-        let mut gossipsub: gossipsub::Gossipsub = gossipsub::Gossipsub::new(
-            MessageAuthenticity::Signed(LOCAL_KEY.clone()),
-            gossipsub_config,
-        )
-        .expect("correct configuration");
-
-        gossipsub.subscribe(&topic).unwrap();
-
-        // add an explicit peer if one was provided
-        if let Some(explicit) = std::env::args().nth(2) {
-            println!("connect to peer {:?}", explicit);
-            match explicit.parse() {
-                Ok(id) => gossipsub.add_explicit_peer(&id),
-                Err(err) => println!("Failed to parse explicit peer id: {:?}", err),
-            }
-        }
-        //gossipsub.add_explicit_peer(&("12D3KooWFcBRGArh4tWVZURPMBdkCUnPrSwzUVF2BkFFZjNUcBhE".to_owned().parse().unwrap()));
-        libp2p::Swarm::new(transport, gossipsub, LOCAL_PEER_ID.clone())
     };
 
     swarm
         .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
         .unwrap();
 
-    let mut stdin = io::BufReader::new(io::stdin()).lines().fuse();
+    let mut stdin = io::BufReader::new(io::stdin()).lines();
 
     loop {
-        select! {
-            line = stdin.select_next_some() => {
-                    let line_unwrapped = line.unwrap();
+        tokio::select! {
+            line = stdin.next_line() => {
+                    let line_unwrapped = line?.expect("stdin closed");
                     if line_unwrapped.starts_with("dial peer ") {
                         let string: String = line_unwrapped.replace("dial peer ", "");
                         let mut string_split = string.split(" ");
                         let peer_id: PeerId = string_split.next().unwrap().parse().expect("User to provide valid address.");
-                        let dial_opts = DialOpts::peer_id(peer_id)
-                            .condition(PeerCondition::Disconnected)
-                            .addresses(vec![string_split.next().unwrap().parse().unwrap()])
-                            .extend_addresses_through_behaviour()
-                            .build();
-                        match swarm.dial(dial_opts) {
-                            Ok(_) => println!("Dialed {:?}", peer_id),
-                            Err(e) => println!("Dial {:?} failed: {:?}", peer_id, e),
-                        };
+                        let addr: Multiaddr = string_split.next().unwrap().parse().unwrap();
+                        dial_peer(&mut swarm, &peer_id, &addr);
                     }
                     if line_unwrapped.starts_with("send message ") {
                         if let Err(e) = swarm
                         .behaviour_mut()
-                        .publish(topic.clone(), line_unwrapped.as_bytes())
-                    {
-                        println!("Publish error: {:?}", e);
+                        .gossipsub
+                        .publish(TOPIC.clone(), line_unwrapped.as_bytes())
+                        {
+                            println!("Publish error: {:?}", e);
+                        }
                     }
+                    if line_unwrapped.starts_with("ls p") {
+                        println!("discovered nodes (mdns): {:?}", swarm
+                        .behaviour_mut()
+                        .mdns
+                        .discovered_nodes().collect::<Vec<_>>());
+
+                        println!("connected peers (gossipsub): {:?}", swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .all_peers().collect::<Vec<_>>());
                 }
 
-            },
+            }
             event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(GossipsubEvent::Message {
-                    propagation_source: peer_id,
-                    message_id: id,
-                    message,
-                }) => println!(
-                    "Got message: {} with id: {} from peer: {:?}",
-                    String::from_utf8_lossy(&message.data),
-                    id,
-                    peer_id
-                ),
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Listening on {:?}", address);
-                }
-                other => {println!("other event: {:?}", other)}
+                SwarmEvent::Behaviour(NetworkEvent::Gossipsub(event)) =>
+                    {
+                        match event {
+                            GossipsubEvent::Subscribed{peer_id, topic} => {
+                                gossipsub_peers.insert(peer_id);
+                                info!("Gossipsub Subscribed | PeerId: {:?}, Topic: {:?}", peer_id, topic);
+                            },
+                            GossipsubEvent::Message{propagation_source, message_id, message} => {
+                                info!("Gossipsub Message | PropagationSource: {:?}, MesssageId: {:?}, Message: {:?}", propagation_source, message_id, message);
+                            },
+                            GossipsubEvent::Unsubscribed{peer_id, topic} => {
+                                gossipsub_peers.remove(&peer_id);
+                                info!("Gossipsub Unsubscribed | PeerId: {:?}, Topic: {:?}", peer_id, topic);
+                            },
+                            GossipsubEvent::GossipsubNotSupported{peer_id} => {
+                                gossipsub_peers.remove(&peer_id);
+                                info!("Gossipsub NotSupported | PeerId: {:?}", peer_id);
+                            },
+                        }
+                    },
+                SwarmEvent::Behaviour(NetworkEvent::TokioMdns(event)) =>
+                    match event {
+                        // On each Discovered event, we connect to all newly discovered peers
+                        MdnsEvent::Discovered(peers) => {
+                            println!("discovered event called");
+                            let mut unique_peers = HashMap::<PeerId, Multiaddr>::new();
+                            for (peer, addr) in peers {
+                                info!("discovered peer {} {}", peer, addr);
+                                    unique_peers.entry(peer).or_insert(addr);
+                            }
+                            let unique_vec = unique_peers.iter().collect::<Vec<_>>();
+                            for (peer, addr) in unique_vec {
+                                // Check if not already connected to Peer
+                                if !gossipsub_peers.contains(peer) {
+                                    dial_peer(&mut swarm, peer, addr);
+                                }
+                            }
+                        },
+                        MdnsEvent::Expired(expired) => {
+                            for (peer, addr) in expired {
+                                info!("peer expired {} {}", peer, addr);
+                            }
+                        },
+                    },
+                SwarmEvent::IncomingConnection { local_addr, .. } =>
+                info!("SwarmEvent IncomingConnection Address: {:?}", local_addr),
+                SwarmEvent::IncomingConnectionError { local_addr, send_back_addr: _, error } =>
+                info!("SwarmEvent IncomingConnectionError Address: {:?} Error: {:?}", local_addr, error),
+                SwarmEvent::NewListenAddr { address, .. } =>
+                info!("SwarmEvent NewListenAddr Address: {:?}", address),
+                SwarmEvent::ConnectionClosed{ peer_id, endpoint: _, num_established: _, cause } => {
+                    // As soon as a Peer disconnects, we have to manually remove him from our gossipsub peers
+                    info!("SwarmEvent ConnectionClosed PeerId: {:?} | Cause: {:?}", peer_id, cause);
+                    swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                    gossipsub_peers.remove(&peer_id);
+                },
+                SwarmEvent::ConnectionEstablished{peer_id, ..} => {
+                    info!("SwarmEvent ConnectionEstablished PeerId: {:?}", peer_id);
+                },
+                SwarmEvent::OutgoingConnectionError{peer_id, ..} => {
+                    info!("SwarmEvent OutgoingConnectionError PeerId: {:?}", peer_id);
+                },
+                SwarmEvent::ExpiredListenAddr{listener_id, ..} => {
+                    info!("SwarmEvent ExpiredListenAddr ListenerId: {:?}", listener_id);
+                },
+                SwarmEvent::ListenerClosed{listener_id, ..} => {
+                    info!("SwarmEvent ListenerClosed ListenerId: {:?}", listener_id);
+                },
+                SwarmEvent::ListenerError{listener_id, ..} => {
+                    info!("SwarmEvent ListenerError ListenerId: {:?}", listener_id);
+                },
+                _ =>
+                info!("got other swarm event")
+
             }
         }
     }
+}
+
+fn dial_peer(swarm: &mut Swarm<BlockchainBehavior>, peer_id: &PeerId, addr: &Multiaddr) {
+    let dial_opts = DialOpts::peer_id(peer_id.clone())
+        // NotDialing == not dialing + not connected
+        .condition(PeerCondition::NotDialing)
+        .addresses(vec![addr.clone()])
+        // If we extend the address and connect to the same peer on multiple addresses,
+        // a connection error is thrown for the second and all following connections.
+        // .extend_addresses_through_behaviour()
+        .build();
+    match &swarm.dial(dial_opts) {
+        Ok(_) => println!("Dialed {:?} {:?}", peer_id, addr),
+        Err(e) => println!("Dial {:?} failed: {:?}", peer_id, e),
+    };
+}
+
+fn build_gossipsub_behavior() -> Gossipsub {
+    // To content-address message, we can take the hash of message and use it as an ID.
+    let message_id_fn = |message: &GossipsubMessage| {
+        let mut s = DefaultHasher::new();
+        message.data.hash(&mut s);
+        MessageId::from(s.finish().to_string())
+    };
+
+    // Set a custom gossip
+    let gossipsub_config = GossipsubConfigBuilder::default()
+        .validation_mode(ValidationMode::Strict)
+        .message_id_fn(message_id_fn)
+        .build()
+        .expect("valid config");
+
+    // Build a gossipsub network behavior
+    let mut gossipsub: Gossipsub = Gossipsub::new(
+        MessageAuthenticity::Signed(LOCAL_KEY.clone()),
+        gossipsub_config,
+    )
+    .expect("correct configuration");
+
+    gossipsub.subscribe(&TOPIC).unwrap();
+
+    // add an explicit peer if one was provided
+    // if let Some(explicit) = std::env::args().nth(3) {
+    //     println!("connect to peer {:?}", explicit);
+    //     match explicit.parse() {
+    //         Ok(id) => gossipsub.add_explicit_peer(&id),
+    //         Err(err) => println!("Failed to parse explicit peer id: {:?}", err),
+    //     }
+    // }
+
+    gossipsub
 }
