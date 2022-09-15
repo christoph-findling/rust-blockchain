@@ -1,4 +1,4 @@
-use rust_blockchain::{Block, Chain};
+use rust_blockchain::{blockchain::*};
 
 #[test]
 fn test_create_chain() {

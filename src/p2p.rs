@@ -18,14 +18,23 @@ use libp2p::{
 use once_cell::sync::Lazy;
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use tokio::io::{self, AsyncBufReadExt};
+use tokio::{io::{self, AsyncBufReadExt}, sync::mpsc};
 use tracing::{info, Level};
+
+use crate::blockchain::Block;
 
 // Generate local keypair
 static LOCAL_KEY: Lazy<identity::Keypair> = Lazy::new(identity::Keypair::generate_ed25519);
 static LOCAL_PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(LOCAL_KEY.public()));
 // Create a gossipsub topic
 static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("blockchain"));
+
+pub enum EventType {
+    // Init,
+    ListPeers,
+    SendMessage(String),
+    // AddBlock(Block),
+}
 
 #[derive(NetworkBehaviour)]
 #[behaviour(out_event = "NetworkEvent")]
@@ -51,7 +60,7 @@ impl From<MdnsEvent> for NetworkEvent {
     }
 }
 
-pub async fn init_p2p() -> Result<(), std::io::Error> {
+pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<(), std::io::Error> {
     println!("Local PeerId: {:?}", LOCAL_PEER_ID.clone());
 
     // We manually keep track of all currently connected gossipsub peers
@@ -98,25 +107,9 @@ pub async fn init_p2p() -> Result<(), std::io::Error> {
 
     loop {
         tokio::select! {
-            line = stdin.next_line() => {
-                    let line_unwrapped = line?.expect("stdin closed");
-                    if line_unwrapped.starts_with("dial peer ") {
-                        let string: String = line_unwrapped.replace("dial peer ", "");
-                        let mut string_split = string.split(" ");
-                        let peer_id: PeerId = string_split.next().unwrap().parse().expect("User to provide valid address.");
-                        let addr: Multiaddr = string_split.next().unwrap().parse().unwrap();
-                        dial_peer(&mut swarm, &peer_id, &addr);
-                    }
-                    if line_unwrapped.starts_with("send message ") {
-                        if let Err(e) = swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(TOPIC.clone(), line_unwrapped.as_bytes())
-                        {
-                            println!("Publish error: {:?}", e);
-                        }
-                    }
-                    if line_unwrapped.starts_with("ls p") {
+            event = rx_rcv.recv() => {
+                match event {
+                    Some(EventType::ListPeers) => {
                         println!("discovered nodes (mdns): {:?}", swarm
                         .behaviour_mut()
                         .mdns
@@ -126,8 +119,21 @@ pub async fn init_p2p() -> Result<(), std::io::Error> {
                         .behaviour_mut()
                         .gossipsub
                         .all_peers().collect::<Vec<_>>());
+                    },
+                    Some(EventType::SendMessage(message)) => {
+                        if let Err(e) = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(TOPIC.clone(), message.as_bytes())
+                        {
+                            println!("Publish error: {:?}", e);
+                        }
+                    },
+                    None => {
+                        info!("p2p channel closed.");
+                        return Ok(());
+                    }
                 }
-
             }
             event = swarm.select_next_some() => match event {
                 SwarmEvent::Behaviour(NetworkEvent::Gossipsub(event)) =>

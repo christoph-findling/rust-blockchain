@@ -1,5 +1,6 @@
 #![feature(test)]
 extern crate rust_blockchain;
+use rust_blockchain::blockchain as blockchain;
 extern crate test;
 
 use test::Bencher;
@@ -34,21 +35,21 @@ test test_hashing_sync ... bench: 961,240,210 ns/iter (+/- 102,724,215)
 
 #[bench]
 fn test_hashing_single_thread(b: &mut Bencher) {
-    b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", 1 as usize));
+    b.iter(|| blockchain::find_hash("prev_hash", "data", 1234545678, "00", 1 as usize));
 }
 
 #[bench]
 fn test_hashing_two_threads(b: &mut Bencher) {
-    b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", 2 as usize));
+    b.iter(|| blockchain::find_hash("prev_hash", "data", 1234545678, "00", 2 as usize));
 }
 
 #[bench]
 fn test_hashing_multithreaded(b: &mut Bencher) {
     let threads = num_cpus::get();
-    b.iter(|| rust_blockchain::find_hash("prev_hash", "data", 1234545678, "00", threads));
+    b.iter(|| blockchain::find_hash("prev_hash", "data", 1234545678, "00", threads));
 }
 
 #[bench]
 fn test_hashing_sync(b: &mut Bencher) {
-    b.iter(|| rust_blockchain::find_hash_sync("prev_hash", "data", 1234545678, "00"));
+    b.iter(|| blockchain::find_hash_sync("prev_hash", "data", 1234545678, "00"));
 }
