@@ -1,4 +1,4 @@
-use rust_blockchain::{Block, Chain};
+use rust_blockchain::{blockchain::*};
 
 #[test]
 fn test_create_chain() {
@@ -25,9 +25,9 @@ fn test_add_blocks() {
     let block2 = chain.blocks.get(&block2_hash).unwrap();
     let block3 = chain.blocks.get(&block3_hash).unwrap();
 
-    assert_eq!(chain.check_if_block_valid(block1), Ok(()));
-    assert_eq!(chain.check_if_block_valid(block2), Ok(()));
-    assert_eq!(chain.check_if_block_valid(block3), Ok(()));
+    assert!(matches!(chain.check_if_block_valid(block1), Ok(())));
+    assert!(matches!(chain.check_if_block_valid(block2), Ok(())));
+    assert!(matches!(chain.check_if_block_valid(block3), Ok(())));
 
     assert_eq!(block1.id, 1);
     assert_eq!(block1.data, "new block 1");
