@@ -16,12 +16,10 @@ use libp2p::{
     Multiaddr, NetworkBehaviour, PeerId, Swarm, Transport,
 };
 use once_cell::sync::Lazy;
-use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::{collections::{hash_map::DefaultHasher, HashMap, HashSet}};
 use std::hash::{Hash, Hasher};
-use tokio::{io::{self, AsyncBufReadExt}, sync::mpsc};
+use tokio::{io::{self, AsyncBufReadExt}, sync::{mpsc, oneshot}};
 use tracing::{info, Level};
-
-use crate::blockchain::Block;
 
 // Generate local keypair
 static LOCAL_KEY: Lazy<identity::Keypair> = Lazy::new(identity::Keypair::generate_ed25519);
@@ -29,8 +27,9 @@ static LOCAL_PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(LOCAL_KEY.public(
 // Create a gossipsub topic
 static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("blockchain"));
 
+#[derive(Debug)]
 pub enum EventType {
-    // Init,
+    Init,
     ListPeers,
     SendMessage(String),
     // AddBlock(Block),
@@ -60,7 +59,7 @@ impl From<MdnsEvent> for NetworkEvent {
     }
 }
 
-pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<(), std::io::Error> {
+pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>, tx_init_sender: oneshot::Sender<EventType>) -> Result<(), std::io::Error> {
     println!("Local PeerId: {:?}", LOCAL_PEER_ID.clone());
 
     // We manually keep track of all currently connected gossipsub peers
@@ -103,6 +102,10 @@ pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<
         .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
         .unwrap();
 
+    if let Err(err) = tx_init_sender.send(EventType::Init) {
+        println!("P2P init receiver error: {:?}", err);
+    }
+
     let mut stdin = io::BufReader::new(io::stdin()).lines();
 
     loop {
@@ -128,6 +131,9 @@ pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<
                         {
                             println!("Publish error: {:?}", e);
                         }
+                    },
+                    Some(EventType::Init) => {
+
                     },
                     None => {
                         info!("p2p channel closed.");
