@@ -1,0 +1,45 @@
+version: '3.4'
+
+volumes:
+  postgres_data:
+      driver: local
+
+services:
+  postgres:
+    image: postgres:13.6
+    container_name: postgres
+    networks:
+      - docker-net
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: blockchain
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: pw
+    ports:
+      - 5432:5432
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    restart: always
+    depends_on:
+      - postgres
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_USER:-p@p.de}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-pw}
+    networks:
+      - docker-net
+    ports:
+      - "${PORT_PGADMIN:-8042}:80"
+    volumes:
+      - ./volumes/pgadmin:/var/lib/pgadmin/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        
+networks:
+  docker-net:
+    name: docker-net
