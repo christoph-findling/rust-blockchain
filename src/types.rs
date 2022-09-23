@@ -1,10 +1,33 @@
 use crate::blockchain::Block;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum EventType {
-    Init,
+    InitDone,
     ListPeers,
-    SendMessage(String),
-    GetLatestBlock,
-    GotLatestBlock(Block)
+    SendLatestBlockRequest {
+        receiver: String
+    },
+    SendLatestBlock {
+        receiver: String,
+        block: Block
+    },
+    ReceivedLatestBlock {
+        sender: String,
+        block: Block
+    },
+    SendNewBlock(Block),
+    ReceivedNewBlock(Block),
+    SendChain {
+        receiver: String,
+        chain: Vec<Block>
+    },
+    SendChainRequest {
+        receiver: String
+    },
+    ReceivedChainRequest {
+        receiver: String
+    },
+    ReceivedChain {
+        chain: Vec<Block>
+    }
 }

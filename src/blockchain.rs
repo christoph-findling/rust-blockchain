@@ -10,6 +10,7 @@ use tokio_postgres::Client;
 const BLOCK_DIFFICULTY: &str = "00";
 const GENESIS_BLOCK_DATA: &str = "some random newspaper headline from today";
 const GENESIS_BLOCK_HASH: &str = "0A31F6A1DB36EEDF9AA5C56AB90DCC76A3ABD90C77B1198336FD1AE512193F";
+const GENESIS_BLOCK_TIME: i64 = 0;
 
 fn error_chain_fmt(e: &dyn std::error::Error, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     writeln!(f, "{}\n", e)?;
@@ -96,7 +97,6 @@ impl From<std::io::Error> for BlockchainError {
 
 #[derive(Serialize, Debug, Deserialize, Clone)]
 pub struct Chain {
-    //pub blocks: HashMap<String, Block>, // BTC uses levelDB to store key value pairs, we use a HashMap
     pub latest_block: Block,
 }
 
@@ -124,7 +124,7 @@ impl Chain {
         let latest_block = Chain::get_latest_block(db_client).await;
 
         match latest_block {
-            Ok(block) => Chain::build(block).await,
+            Ok(block) => Ok(Chain::build(block)),
             Err(_) => Chain::new(db_client).await,
         }
     }
@@ -152,16 +152,112 @@ impl Chain {
             .await?;
 
         Ok(Self {
-            //blocks: HashMap::from([(block.hash.clone(), block)]),
             latest_block: block,
         })
     }
 
-    pub async fn build(latest_block: Block) -> Result<Self, BlockchainError> {
-        Ok(Self {
-            //blocks: HashMap::from([(block.hash.clone(), block)]),
-            latest_block: latest_block,
-        })
+    pub fn build(latest_block: Block) -> Self {
+        Self {
+            latest_block,
+        }
+    }
+
+    pub async fn update(&mut self, db_client: &mut Client, chain: &mut Vec<Block>) -> Result<(), BlockchainError> {
+
+        // We simply delete all rows and insert the incoming blocks for now
+        db_client.execute("
+        DELETE FROM blocks;
+        ",
+    &[]).await?;
+
+        let statement = db_client.prepare_typed(
+            "INSERT INTO blocks (hash, id, prev_hash, timestamp, nonce, data) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[Type::VARCHAR, Type::INT8, Type::VARCHAR, Type::INT8, Type::INT8, Type::VARCHAR],
+        ).await?;
+
+        chain.sort_by(|a, b| a.id.cmp(&b.id));
+
+        for (index, block) in chain.iter().enumerate() {
+            db_client
+            .execute(
+                &statement,
+                &[
+                    &block.hash,
+                    &block.id,
+                    &block.prev_hash,
+                    &block.timestamp,
+                    &block.nonce,
+                    &block.data,
+                ],
+            )
+            .await?;
+
+            if index == chain.len() - 1 {
+                self.latest_block = block.clone();
+            }
+        }
+
+        Ok(())
+    }
+
+
+    pub async fn add_block(&mut self, db_client: &mut Client, block: Block) -> Result<(), BlockchainError> {
+
+       Chain::check_if_block_valid(db_client, &block).await?;
+
+        let statement = db_client.prepare_typed(
+            "INSERT INTO blocks (hash, id, prev_hash, timestamp, nonce, data) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[Type::VARCHAR, Type::INT8, Type::VARCHAR, Type::INT8, Type::INT8, Type::VARCHAR],
+        ).await?;
+
+            db_client
+            .execute(
+                &statement,
+                &[
+                    &block.hash,
+                    &block.id,
+                    &block.prev_hash,
+                    &block.timestamp,
+                    &block.nonce,
+                    &block.data,
+                ],
+            )
+            .await?;
+
+            self.latest_block = block;
+
+        Ok(())
+    }
+
+    pub async fn get_chain(db_client: &mut Client) -> Result<Vec<Block>, BlockchainError> {
+        let res = db_client
+            .query(
+                
+                    "
+    SELECT * 
+    FROM blocks
+    ORDER BY id ASC
+    ",
+                &[],
+            )
+            .await;
+
+        match res {
+            Ok(row_vec) => {
+                return Ok(row_vec.iter().map(|row| Block {
+                    hash: row.get(0),
+                    id: row.get(1),
+                    prev_hash: row.get(2),
+                    timestamp: row.get(3),
+                    nonce: row.get(4),
+                    data: row.get(5),
+                }).collect::<Vec<Block>>());
+            },
+            Err(err) => {
+                error!("Error getting chain");
+                return Err(BlockchainError::DatabaseError(err));
+            }
+        }
     }
 
     pub async fn get_block(db_client: &mut Client, key: &str) -> Result<Block, BlockchainError> {
@@ -222,7 +318,7 @@ impl Chain {
         &mut self,
         data: String,
         db_client: &mut Client,
-    ) -> Result<&Block, BlockchainError> {
+    ) -> Result<Block, BlockchainError> {
         info!("Mining block...");
         trace!("Mining block...");
 
@@ -249,7 +345,7 @@ impl Chain {
 
         //self.blocks.insert(block.hash.clone(), block);
         self.latest_block = block;
-        Ok(&self.latest_block)
+        Ok(self.latest_block.clone())
     }
 
     pub async fn check_if_block_valid(
@@ -270,15 +366,9 @@ impl Chain {
             return Err(BlockchainError::BlockInvalid(block.hash.to_owned()));
         }
 
-        let get_block = Chain::get_block(db_client, &block_hash).await?;
-        if get_block.id != block.id {
-            return Err(BlockchainError::BlockInvalid(block.hash.to_owned()));
-        }
-
         Ok(())
     }
 
-    #[tracing::instrument(name = "Validating chain")]
     pub async fn validate_chain(&self, db_client: &mut Client) -> Result<(), BlockchainError> {
         let block_count_row = db_client
             .query_one(
@@ -311,7 +401,7 @@ impl Chain {
             }
 
             blocks_validated += 1;
-            
+
             if current_block.id == 0 {
                 if blocks_validated == block_count {
                     if current_block.hash == GENESIS_BLOCK_HASH {
@@ -330,7 +420,7 @@ impl Chain {
     }
 }
 
-#[derive(Serialize, Debug, Deserialize, Clone)]
+#[derive(Serialize, Debug, Deserialize, Clone, PartialEq)]
 pub struct Block {
     pub hash: String,
     pub id: i64,
@@ -363,12 +453,12 @@ impl Block {
     }
 
     pub fn create_genesis() -> Self {
-        let timestamp = Utc::now().timestamp();
+        // let timestamp = Utc::now().timestamp();
         Self {
             hash: GENESIS_BLOCK_HASH.to_owned(),
             id: 0,
             prev_hash: "null".to_owned(),
-            timestamp,
+            timestamp: GENESIS_BLOCK_TIME,
             nonce: 0,
             data: GENESIS_BLOCK_DATA.to_owned(),
         }
@@ -452,7 +542,7 @@ pub fn hasher(prev_hash: &str, data: &str, timestamp: i64, nonce: i64) -> String
     string
 }
 
-// Synchronous hashing function only used for benchmarking comparison, see benches/benchmark.rs
+// Synchronous hashing function only used for benchmarking, see benches/benchmark.rs
 pub fn find_hash_sync(
     prev_hash: &str,
     data: &str,
