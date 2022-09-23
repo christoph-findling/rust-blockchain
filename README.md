@@ -54,7 +54,7 @@ https://github.com/rui314/mold would be an even faster alternative (available fo
 
 ## Mining
 
-The hashing algorithm is executed in X threads in parallel (where X = available cores of the system). Benchmark tests that compare different numbers of threads and workloads per thread can be found under **benches/benchmark.rs**
+The hashing algorithm is executed in X threads in parallel (where X = available cores of the system). Benchmark tests that compare different numbers of threads and workloads per thread can be found under **benches/benchmark.rs**. Run benches with `cargo +nightly bench`
 
 
 ## Possible improvements (that I might or might not tackle in the future)
