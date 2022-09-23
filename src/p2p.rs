@@ -16,12 +16,17 @@ use libp2p::{
     Multiaddr, NetworkBehaviour, PeerId, Swarm, Transport,
 };
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use tokio::{io::{self, AsyncBufReadExt}, sync::mpsc};
-use tracing::{info, Level};
+use tokio::{
+    io::{self, AsyncBufReadExt},
+    sync::{mpsc},
+};
+use tracing::{debug, error, Level};
 
 use crate::blockchain::Block;
+use crate::types::EventType;
 
 // Generate local keypair
 static LOCAL_KEY: Lazy<identity::Keypair> = Lazy::new(identity::Keypair::generate_ed25519);
@@ -29,11 +34,37 @@ static LOCAL_PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(LOCAL_KEY.public(
 // Create a gossipsub topic
 static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("blockchain"));
 
-pub enum EventType {
-    // Init,
-    ListPeers,
-    SendMessage(String),
-    // AddBlock(Block),
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedLatestBlock {
+    receiver: String,
+    block: Block,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedNewBlock {
+    block: Block,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedChain {
+    receiver: String,
+    chain: Vec<Block>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChainRequest {
+    receiver: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LatestBlockRequest {
+    receiver: String,
+    random: bool,
 }
 
 #[derive(NetworkBehaviour)]
@@ -60,7 +91,10 @@ impl From<MdnsEvent> for NetworkEvent {
     }
 }
 
-pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<(), std::io::Error> {
+pub async fn init_p2p(
+    mut rx_rcv: mpsc::UnboundedReceiver<EventType>,
+    main_sender: mpsc::UnboundedSender<EventType>,
+) -> Result<(), std::io::Error> {
     println!("Local PeerId: {:?}", LOCAL_PEER_ID.clone());
 
     // We manually keep track of all currently connected gossipsub peers
@@ -103,7 +137,9 @@ pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<
         .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
         .unwrap();
 
-    let mut stdin = io::BufReader::new(io::stdin()).lines();
+    if let Err(err) = main_sender.send(EventType::InitDone) {
+        println!("P2P init sending error: {:?}", err);
+    }
 
     loop {
         tokio::select! {
@@ -120,19 +156,65 @@ pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<
                         .gossipsub
                         .all_peers().collect::<Vec<_>>());
                     },
-                    Some(EventType::SendMessage(message)) => {
+                    Some(EventType::SendLatestBlock{block, receiver}) => {
+                        debug!("Send latest block to {:?}", receiver);
+                        let req = ReceivedLatestBlock{receiver, block};
+                        let json = serde_json::to_string(&req).expect("can jsonify request");
+
                         if let Err(e) = swarm
                         .behaviour_mut()
                         .gossipsub
-                        .publish(TOPIC.clone(), message.as_bytes())
+                        .publish(TOPIC.clone(), json.as_bytes())
+                        {
+                            println!("Publish error: {:?}", e);
+                        }
+                    },
+                    Some(EventType::SendNewBlock(block)) => {
+                        debug!("Broadcast new block");
+                        let req = ReceivedNewBlock{block};
+                        let json = serde_json::to_string(&req).expect("can jsonify request");
+
+                        if let Err(e) = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(TOPIC.clone(), json.as_bytes())
+                        {
+                            println!("Publish error: {:?}", e);
+                        }
+                    },
+                    Some(EventType::SendChainRequest{receiver}) => {
+                        debug!("Send chain request to {:?}", receiver);
+                        let req = ChainRequest{receiver};
+                        let json = serde_json::to_string(&req).expect("can jsonify request");
+
+                        if let Err(e) = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(TOPIC.clone(), json.as_bytes())
+                        {
+                            println!("Publish error: {:?}", e);
+                        }
+                    },
+                    Some(EventType::SendChain{receiver, chain}) => {
+                        debug!("Send chain to {:?}", receiver);
+                        let req = ReceivedChain{receiver, chain};
+                        let json = serde_json::to_string(&req).expect("can jsonify request");
+
+                        if let Err(e) = swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .publish(TOPIC.clone(), json.as_bytes())
                         {
                             println!("Publish error: {:?}", e);
                         }
                     },
                     None => {
-                        info!("p2p channel closed.");
+                        debug!("p2p channel closed.");
                         return Ok(());
-                    }
+                    },
+                    _ => {
+
+                    },
                 }
             }
             event = swarm.select_next_some() => match event {
@@ -140,19 +222,82 @@ pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<
                     {
                         match event {
                             GossipsubEvent::Subscribed{peer_id, topic} => {
+                                debug!("Gossipsub Subscribed | PeerId: {:?}, Topic: {:?}", peer_id, topic);
+                                if gossipsub_peers.len() == 0 {
+                                    gossipsub_peers.insert(peer_id);
+                                    // Request latest block from peer on first connect/reconnect
+                                    let req = LatestBlockRequest{receiver: peer_id.to_string(), random: true};
+                                    let json = serde_json::to_string(&req).expect("can jsonify request");
+
+                                    if let Err(e) = swarm
+                                    .behaviour_mut()
+                                    .gossipsub
+                                    .publish(TOPIC.clone(), json.as_bytes())
+                                    {
+                                        println!("Publish error: {:?}", e);
+                                    }
+                                    continue;
+                                }
                                 gossipsub_peers.insert(peer_id);
-                                info!("Gossipsub Subscribed | PeerId: {:?}, Topic: {:?}", peer_id, topic);
                             },
-                            GossipsubEvent::Message{propagation_source, message_id, message} => {
-                                info!("Gossipsub Message | PropagationSource: {:?}, MesssageId: {:?}, Message: {:?}", propagation_source, message_id, message);
+                            GossipsubEvent::Message{propagation_source, message_id: _, message} => {
+                                if let Ok(resp) = serde_json::from_slice::<ReceivedLatestBlock>(&message.data) {
+                                    if resp.receiver == LOCAL_PEER_ID.to_string() {
+                                        debug!("ReceivedLatestBlock from {:?}:", message.source);
+                                        if let Some(source) = message.source {
+                                            if let Err(err) = main_sender.send(EventType::ReceivedLatestBlock{sender: source.to_string(), block: resp.block}) {
+                                                debug!("P2P to main ReceivedLatestBlock error: {:?}", err);
+                                            }
+                                        } else {
+                                                debug!("no message source")
+                                            }
+                                    }
+                                } else if let Ok(req) = serde_json::from_slice::<LatestBlockRequest>(&message.data) {
+                                    if req.receiver == LOCAL_PEER_ID.to_string() {
+                                        debug!("SendLatestBlockRequest from {:?}:", message.source);
+                                        if let Some(source) = message.source {
+                                        if let Err(err) = main_sender.send(EventType::SendLatestBlockRequest{receiver: source.to_string()}) {
+                                            debug!("P2P to main SendLatestBlockRequest error: {:?}", err);
+                                        }
+                                    } else {
+                                            debug!("no message source")
+                                        }
+                                    }
+                                } else if let Ok(req) = serde_json::from_slice::<ChainRequest>(&message.data) {
+                                    if req.receiver == LOCAL_PEER_ID.to_string() {
+                                        debug!("ChainRequest from {:?}:", message.source);
+                                        if let Some(source) = message.source {
+                                            if let Err(err) = main_sender.send(EventType::ReceivedChainRequest{receiver: source.to_string()}) {
+                                                debug!("P2P to main ReceivedChainRequest error: {:?}", err);
+                                            }
+                                        } else {
+                                            debug!("no message source")
+                                        }
+                                    }
+                                } else if let Ok(res) = serde_json::from_slice::<ReceivedChain>(&message.data) {
+                                    if res.receiver == LOCAL_PEER_ID.to_string() {
+                                        debug!("ReceivedChain from {:?}:", message.source);
+                                        if let Err(err) = main_sender.send(EventType::ReceivedChain{chain: res.chain}) {
+                                            debug!("P2P to main ReceivedChainRequest error: {:?}", err);
+                                        }
+                                    }
+                                } else if let Ok(res) = serde_json::from_slice::<ReceivedNewBlock>(&message.data) {
+                                    if propagation_source != LOCAL_PEER_ID.clone() {
+                                        debug!("ReceivedNewBlock from {:?}:", message.source);
+                                        if let Err(err) = main_sender.send(EventType::ReceivedNewBlock(res.block)) {
+                                            debug!("P2P to main ReceivedNewBlock error: {:?}", err);
+                                        }
+                                    }
+                                }
+                                //debug!("Gossipsub Message | PropagationSource: {:?}, MesssageId: {:?}, Message: {:?}", propagation_source, message_id, message);
                             },
                             GossipsubEvent::Unsubscribed{peer_id, topic} => {
                                 gossipsub_peers.remove(&peer_id);
-                                info!("Gossipsub Unsubscribed | PeerId: {:?}, Topic: {:?}", peer_id, topic);
+                                debug!("Gossipsub Unsubscribed | PeerId: {:?}, Topic: {:?}", peer_id, topic);
                             },
                             GossipsubEvent::GossipsubNotSupported{peer_id} => {
                                 gossipsub_peers.remove(&peer_id);
-                                info!("Gossipsub NotSupported | PeerId: {:?}", peer_id);
+                                debug!("Gossipsub NotSupported | PeerId: {:?}", peer_id);
                             },
                         }
                     },
@@ -163,7 +308,7 @@ pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<
                             println!("discovered event called");
                             let mut unique_peers = HashMap::<PeerId, Multiaddr>::new();
                             for (peer, addr) in peers {
-                                info!("discovered peer {} {}", peer, addr);
+                                debug!("discovered peer {} {}", peer, addr);
                                     unique_peers.entry(peer).or_insert(addr);
                             }
                             let unique_vec = unique_peers.iter().collect::<Vec<_>>();
@@ -176,39 +321,39 @@ pub async fn init_p2p(mut rx_rcv: mpsc::UnboundedReceiver<EventType>) -> Result<
                         },
                         MdnsEvent::Expired(expired) => {
                             for (peer, addr) in expired {
-                                info!("peer expired {} {}", peer, addr);
+                                debug!("peer expired {} {}", peer, addr);
                             }
                         },
                     },
                 SwarmEvent::IncomingConnection { local_addr, .. } =>
-                info!("SwarmEvent IncomingConnection Address: {:?}", local_addr),
+                debug!("SwarmEvent IncomingConnection Address: {:?}", local_addr),
                 SwarmEvent::IncomingConnectionError { local_addr, send_back_addr: _, error } =>
-                info!("SwarmEvent IncomingConnectionError Address: {:?} Error: {:?}", local_addr, error),
+                debug!("SwarmEvent IncomingConnectionError Address: {:?} Error: {:?}", local_addr, error),
                 SwarmEvent::NewListenAddr { address, .. } =>
-                info!("SwarmEvent NewListenAddr Address: {:?}", address),
+                debug!("SwarmEvent NewListenAddr Address: {:?}", address),
                 SwarmEvent::ConnectionClosed{ peer_id, endpoint: _, num_established: _, cause } => {
                     // As soon as a Peer disconnects, we have to manually remove him from our gossipsub peers
-                    info!("SwarmEvent ConnectionClosed PeerId: {:?} | Cause: {:?}", peer_id, cause);
+                    debug!("SwarmEvent ConnectionClosed PeerId: {:?} | Cause: {:?}", peer_id, cause);
                     swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                     gossipsub_peers.remove(&peer_id);
                 },
                 SwarmEvent::ConnectionEstablished{peer_id, ..} => {
-                    info!("SwarmEvent ConnectionEstablished PeerId: {:?}", peer_id);
+                    debug!("SwarmEvent ConnectionEstablished PeerId: {:?}", peer_id);
                 },
                 SwarmEvent::OutgoingConnectionError{peer_id, ..} => {
-                    info!("SwarmEvent OutgoingConnectionError PeerId: {:?}", peer_id);
+                    debug!("SwarmEvent OutgoingConnectionError PeerId: {:?}", peer_id);
                 },
                 SwarmEvent::ExpiredListenAddr{listener_id, ..} => {
-                    info!("SwarmEvent ExpiredListenAddr ListenerId: {:?}", listener_id);
+                    debug!("SwarmEvent ExpiredListenAddr ListenerId: {:?}", listener_id);
                 },
                 SwarmEvent::ListenerClosed{listener_id, ..} => {
-                    info!("SwarmEvent ListenerClosed ListenerId: {:?}", listener_id);
+                    debug!("SwarmEvent ListenerClosed ListenerId: {:?}", listener_id);
                 },
                 SwarmEvent::ListenerError{listener_id, ..} => {
-                    info!("SwarmEvent ListenerError ListenerId: {:?}", listener_id);
+                    debug!("SwarmEvent ListenerError ListenerId: {:?}", listener_id);
                 },
                 _ =>
-                info!("got other swarm event")
+                debug!("got other swarm event")
 
             }
         }
@@ -253,15 +398,6 @@ fn build_gossipsub_behavior() -> Gossipsub {
     .expect("correct configuration");
 
     gossipsub.subscribe(&TOPIC).unwrap();
-
-    // add an explicit peer if one was provided
-    // if let Some(explicit) = std::env::args().nth(3) {
-    //     println!("connect to peer {:?}", explicit);
-    //     match explicit.parse() {
-    //         Ok(id) => gossipsub.add_explicit_peer(&id),
-    //         Err(err) => println!("Failed to parse explicit peer id: {:?}", err),
-    //     }
-    // }
 
     gossipsub
 }

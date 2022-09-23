@@ -1,16 +1,16 @@
-
-
 use chrono::Utc;
-use log::{info, trace};
+use log::{error, info, trace};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tokio_postgres::types::Type;
+use tokio_postgres::Client;
 
-const DIFFICULTY: &str = "00";
-const GENESIS_BLOCK_DATA: &str = "genesis block";
+const BLOCK_DIFFICULTY: &str = "00";
+const GENESIS_BLOCK_DATA: &str = "some random newspaper headline from today";
 const GENESIS_BLOCK_HASH: &str = "0A31F6A1DB36EEDF9AA5C56AB90DCC76A3ABD90C77B1198336FD1AE512193F";
+const GENESIS_BLOCK_TIME: i64 = 0;
 
 fn error_chain_fmt(e: &dyn std::error::Error, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     writeln!(f, "{}\n", e)?;
@@ -26,7 +26,8 @@ pub enum BlockchainError {
     BlockInvalid(String),
     ChainInvalid(Box<BlockchainError>),
     BlockNotFound(String),
-    MiscError(Box<dyn std::error::Error>),
+    IoError(std::io::Error),
+    DatabaseError(tokio_postgres::Error),
     Error(String),
 }
 
@@ -45,7 +46,8 @@ impl std::fmt::Display for BlockchainError {
             BlockchainError::Error(err) => {
                 write!(f, "error: {}", err)
             }
-            BlockchainError::MiscError(ref err) => err.fmt(f),
+            BlockchainError::DatabaseError(ref err) => err.fmt(f),
+            BlockchainError::IoError(ref err) => err.fmt(f),
         }
     }
 }
@@ -56,7 +58,8 @@ impl std::error::Error for BlockchainError {
             BlockchainError::ChainInvalid(err) => Some(err),
             BlockchainError::BlockInvalid(_) => None,
             BlockchainError::BlockNotFound(_) => None,
-            BlockchainError::MiscError(_) => None,
+            BlockchainError::IoError(err) => Some(err),
+            BlockchainError::DatabaseError(err) => Some(err),
             BlockchainError::Error(_) => None,
         }
     }
@@ -65,6 +68,18 @@ impl std::error::Error for BlockchainError {
 impl std::fmt::Debug for BlockchainError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         error_chain_fmt(&self, fmt)
+    }
+}
+
+impl From<tokio_postgres::Error> for BlockchainError {
+    fn from(err: tokio_postgres::Error) -> Self {
+        Self::DatabaseError(err)
+    }
+}
+
+impl From<std::io::Error> for BlockchainError {
+    fn from(err: std::io::Error) -> Self {
+        Self::IoError(err)
     }
 }
 
@@ -82,115 +97,336 @@ impl std::fmt::Debug for BlockchainError {
 
 #[derive(Serialize, Debug, Deserialize, Clone)]
 pub struct Chain {
-    pub blocks: HashMap<String, Block>, // BTC uses levelDB to store key value pairs, we use a HashMap
-    pub latest_block: String,
+    pub latest_block: Block,
 }
 
 impl Chain {
-    pub fn new() -> Self {
-        let genesis_block = Block::create_genesis();
-        let genesis_hash = genesis_block.hash.clone();
-        Self {
-            blocks: HashMap::from([(genesis_block.hash.clone(), genesis_block)]),
-            latest_block: genesis_hash,
+    pub async fn init(db_client: &mut Client) -> Result<Self, BlockchainError> {
+        if let Err(err) = db_client
+            .execute(
+                "
+    CREATE TABLE IF NOT EXISTS blocks (
+        hash            VARCHAR PRIMARY KEY,
+        id              INT8 UNIQUE NOT NULL,
+        prev_hash       VARCHAR UNIQUE NOT NULL,
+        timestamp       INT8 NOT NULL,
+        nonce           INT8 NOT NULL,
+        data            VARCHAR NOT NULL
+        )
+",
+                &[],
+            )
+            .await
+        {
+            error!("Error creating blockchain table: {:?}", err)
+        }
+
+        let latest_block = Chain::get_latest_block(db_client).await;
+
+        match latest_block {
+            Ok(block) => Ok(Chain::build(block)),
+            Err(_) => Chain::new(db_client).await,
         }
     }
 
-    pub fn get_block(&self, key: &str) -> Option<&Block> {
-        self.blocks.get(key)
+    pub async fn new(db_client: &mut Client) -> Result<Self, BlockchainError> {
+        let block = Block::create_genesis();
+
+        let statement = db_client.prepare_typed(
+            "INSERT INTO blocks (hash, id, prev_hash, timestamp, nonce, data) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[Type::VARCHAR, Type::INT8, Type::VARCHAR, Type::INT8, Type::INT8, Type::VARCHAR],
+        ).await?;
+
+        db_client
+            .execute(
+                &statement,
+                &[
+                    &block.hash,
+                    &block.id,
+                    &block.prev_hash,
+                    &block.timestamp,
+                    &block.nonce,
+                    &block.data,
+                ],
+            )
+            .await?;
+
+        Ok(Self {
+            latest_block: block,
+        })
     }
 
-    pub fn mine_block(&mut self, data: String) -> Result<String, BlockchainError> {
+    pub fn build(latest_block: Block) -> Self {
+        Self {
+            latest_block,
+        }
+    }
+
+    pub async fn update(&mut self, db_client: &mut Client, chain: &mut Vec<Block>) -> Result<(), BlockchainError> {
+
+        // We simply delete all rows and insert the incoming blocks for now
+        db_client.execute("
+        DELETE FROM blocks;
+        ",
+    &[]).await?;
+
+        let statement = db_client.prepare_typed(
+            "INSERT INTO blocks (hash, id, prev_hash, timestamp, nonce, data) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[Type::VARCHAR, Type::INT8, Type::VARCHAR, Type::INT8, Type::INT8, Type::VARCHAR],
+        ).await?;
+
+        chain.sort_by(|a, b| a.id.cmp(&b.id));
+
+        for (index, block) in chain.iter().enumerate() {
+            db_client
+            .execute(
+                &statement,
+                &[
+                    &block.hash,
+                    &block.id,
+                    &block.prev_hash,
+                    &block.timestamp,
+                    &block.nonce,
+                    &block.data,
+                ],
+            )
+            .await?;
+
+            if index == chain.len() - 1 {
+                self.latest_block = block.clone();
+            }
+        }
+
+        Ok(())
+    }
+
+
+    pub async fn add_block(&mut self, db_client: &mut Client, block: Block) -> Result<(), BlockchainError> {
+
+       Chain::check_if_block_valid(db_client, &block).await?;
+
+        let statement = db_client.prepare_typed(
+            "INSERT INTO blocks (hash, id, prev_hash, timestamp, nonce, data) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[Type::VARCHAR, Type::INT8, Type::VARCHAR, Type::INT8, Type::INT8, Type::VARCHAR],
+        ).await?;
+
+            db_client
+            .execute(
+                &statement,
+                &[
+                    &block.hash,
+                    &block.id,
+                    &block.prev_hash,
+                    &block.timestamp,
+                    &block.nonce,
+                    &block.data,
+                ],
+            )
+            .await?;
+
+            self.latest_block = block;
+
+        Ok(())
+    }
+
+    pub async fn get_chain(db_client: &mut Client) -> Result<Vec<Block>, BlockchainError> {
+        let res = db_client
+            .query(
+                
+                    "
+    SELECT * 
+    FROM blocks
+    ORDER BY id ASC
+    ",
+                &[],
+            )
+            .await;
+
+        match res {
+            Ok(row_vec) => {
+                return Ok(row_vec.iter().map(|row| Block {
+                    hash: row.get(0),
+                    id: row.get(1),
+                    prev_hash: row.get(2),
+                    timestamp: row.get(3),
+                    nonce: row.get(4),
+                    data: row.get(5),
+                }).collect::<Vec<Block>>());
+            },
+            Err(err) => {
+                error!("Error getting chain");
+                return Err(BlockchainError::DatabaseError(err));
+            }
+        }
+    }
+
+    pub async fn get_block(db_client: &mut Client, key: &str) -> Result<Block, BlockchainError> {
+        let row = db_client
+            .query_one(
+                &format!(
+                    "
+        SELECT * 
+        FROM blocks
+        WHERE hash = '{}'
+        ",
+                    key
+                ),
+                &[],
+            )
+            .await;
+
+        match row {
+            Ok(row) => Ok(Block {
+                hash: row.get(0),
+                id: row.get(1),
+                prev_hash: row.get(2),
+                timestamp: row.get(3),
+                nonce: row.get(4),
+                data: row.get(5),
+            }),
+            Err(err) => {
+                error!("Block not found: {:?}", key);
+                return Err(BlockchainError::DatabaseError(err));
+            }
+        }
+    }
+
+    pub async fn get_latest_block(db_client: &mut Client) -> Result<Block, BlockchainError> {
+        let row = db_client
+            .query_one(
+                "
+        SELECT * 
+        FROM blocks
+        ORDER BY timestamp DESC
+        LIMIT 1
+        ",
+                &[],
+            )
+            .await?;
+
+        Ok(Block {
+            hash: row.get(0),
+            id: row.get(1),
+            prev_hash: row.get(2),
+            timestamp: row.get(3),
+            nonce: row.get(4),
+            data: row.get(5),
+        })
+    }
+
+    pub async fn mine_block(
+        &mut self,
+        data: String,
+        db_client: &mut Client,
+    ) -> Result<Block, BlockchainError> {
         info!("Mining block...");
         trace!("Mining block...");
-        let latest_block = self
-            .blocks
-            .get(&self.latest_block)
-            .ok_or(BlockchainError::BlockNotFound(self.latest_block.to_owned()))?;
-        let block = Block::new(latest_block, data);
-        let hash = block.hash.clone();
-        self.blocks.insert(block.hash.clone(), block);
-        self.latest_block = hash.clone();
-        Ok(hash)
+
+        let block = Block::new(&self.latest_block, data);
+
+        let statement = db_client.prepare_typed(
+            "INSERT INTO blocks (hash, id, prev_hash, timestamp, nonce, data) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[Type::VARCHAR, Type::INT8, Type::VARCHAR, Type::INT8, Type::INT8, Type::VARCHAR],
+        ).await?;
+
+        db_client
+            .execute(
+                &statement,
+                &[
+                    &block.hash,
+                    &block.id,
+                    &block.prev_hash,
+                    &block.timestamp,
+                    &block.nonce,
+                    &block.data,
+                ],
+            )
+            .await?;
+
+        //self.blocks.insert(block.hash.clone(), block);
+        self.latest_block = block;
+        Ok(self.latest_block.clone())
     }
 
-    pub fn check_if_block_valid(&self, block: &Block) -> Result<(), BlockchainError> {
-        if block.hash == GENESIS_BLOCK_HASH {
+    pub async fn check_if_block_valid(
+        db_client: &mut Client,
+        block: &Block,
+    ) -> Result<(), BlockchainError> {
+        if block.id == 0 && block.hash == GENESIS_BLOCK_HASH {
             return Ok(());
         }
-        if !self.blocks.contains_key(&block.prev_hash) {
-            return Err(BlockchainError::BlockNotFound(block.prev_hash.to_owned()));
-        }
 
-        let prev_block = self
-            .blocks
-            .get(&block.prev_hash)
-            .ok_or(BlockchainError::BlockNotFound(block.prev_hash.to_owned()))?;
-
+        let prev_block = Chain::get_block(db_client, &block.prev_hash).await?;
         if prev_block.id != block.id - 1 {
             return Err(BlockchainError::BlockInvalid(block.hash.to_owned()));
         }
 
         let block_hash = hasher(&block.prev_hash, &block.data, block.timestamp, block.nonce);
-        let get_block = self
-            .blocks
-            .get(&block_hash)
-            .ok_or(BlockchainError::BlockNotFound(block.prev_hash.to_owned()))?;
-
-        if block_hash != block.hash || get_block.id != block.id {
+        if block_hash != block.hash {
             return Err(BlockchainError::BlockInvalid(block.hash.to_owned()));
         }
 
         Ok(())
     }
 
-    #[tracing::instrument(
-        name = "Validating chain"
-    )]
-    pub fn validate_chain(&self) -> Result<(), BlockchainError> {
-        let latest_block = self.get_block(&self.latest_block).ok_or(BlockchainError::ChainInvalid(Box::new(BlockchainError::BlockNotFound(self.latest_block.to_owned()))))?;
-        // let latest_block_valid = self.check_if_block_valid(&latest_block);
-        // if self.blocks.len() == 1 {
-        //     return latest_block_valid;
-        // }
-        let mut current_block_hash = &latest_block.hash;
-        // genesis block is always valid
-        let mut blocks_validated = 1;
+    pub async fn validate_chain(&self, db_client: &mut Client) -> Result<(), BlockchainError> {
+        let block_count_row = db_client
+            .query_one(
+                "
+        SELECT 
+            COUNT (*)
+        FROM blocks
+        ",
+                &[],
+            )
+            .await?;
+
+        let block_count: i64 = block_count_row.get(0);
+
+        if block_count != self.latest_block.id + 1 {
+            return Err(BlockchainError::ChainInvalid(Box::new(
+                BlockchainError::Error("number of blocks != ID of latest block + 1".to_owned()),
+            )));
+        }
+
+        let mut current_block_hash = self.latest_block.hash.to_owned();
+        let mut blocks_validated = 0;
         loop {
-            let current_block =
-                self.blocks
-                    .get(current_block_hash)
-                    .ok_or(BlockchainError::BlockNotFound(
-                        current_block_hash.to_owned(),
-                    ))?;
+            let current_block = Chain::get_block(db_client, &current_block_hash).await?;
+            match Chain::check_if_block_valid(db_client, &current_block).await {
+                Ok(()) => {
+                    current_block_hash = current_block.prev_hash;
+                }
+                Err(err) => return Err(BlockchainError::ChainInvalid(Box::new(err))),
+            }
+
+            blocks_validated += 1;
+
             if current_block.id == 0 {
-                if blocks_validated == self.blocks.len() {
-                    return Ok(());
+                if blocks_validated == block_count {
+                    if current_block.hash == GENESIS_BLOCK_HASH {
+                        return Ok(());
+                    }
+                    return Err(BlockchainError::ChainInvalid(Box::new(
+                        BlockchainError::Error("genesis hash invalid.".to_owned()),
+                    )));
                 } else {
                     return Err(BlockchainError::ChainInvalid(Box::new(
                         BlockchainError::Error("invalid chain length.".to_owned()),
                     )));
                 }
             }
-
-            match self.check_if_block_valid(current_block) {
-                Ok(()) => {
-                    current_block_hash = &current_block.prev_hash;
-                }
-                Err(err) => return Err(BlockchainError::ChainInvalid(Box::new(err))),
-            }
-            blocks_validated += 1;
         }
     }
 }
 
-#[derive(Serialize, Debug, Deserialize, Clone)]
+#[derive(Serialize, Debug, Deserialize, Clone, PartialEq)]
 pub struct Block {
-    pub id: u128,
-    pub nonce: u32,
     pub hash: String,
+    pub id: i64,
     pub prev_hash: String,
     pub timestamp: i64,
+    pub nonce: i64,
     pub data: String,
 }
 
@@ -199,31 +435,37 @@ impl Block {
         let timestamp = Utc::now().timestamp();
         let threads = num_cpus::get();
         println!("threads: {}", threads);
-        let (hash, nonce) = find_hash(&prev_block.hash, &data, timestamp, DIFFICULTY, threads);
-        Self {
-            id: prev_block.id + 1,
-            data,
-            hash,
-            nonce,
+        let (hash, nonce) = find_hash(
+            &prev_block.hash,
+            &data,
             timestamp,
+            BLOCK_DIFFICULTY,
+            threads,
+        );
+        Self {
+            hash,
+            id: prev_block.id + 1,
             prev_hash: prev_block.hash.to_owned(),
+            timestamp,
+            nonce,
+            data,
         }
     }
 
     pub fn create_genesis() -> Self {
-        let timestamp = Utc::now().timestamp();
+        // let timestamp = Utc::now().timestamp();
         Self {
-            id: 0,
-            data: GENESIS_BLOCK_DATA.to_owned(),
             hash: GENESIS_BLOCK_HASH.to_owned(),
+            id: 0,
+            prev_hash: "null".to_owned(),
+            timestamp: GENESIS_BLOCK_TIME,
             nonce: 0,
-            timestamp,
-            prev_hash: "empty hash".to_owned(),
+            data: GENESIS_BLOCK_DATA.to_owned(),
         }
     }
 }
 
-// Takes the input and hashes it with a new nonce until a hash with the desired difficulty is found
+// Takes the input and hashes it with a new nonce until a hash with the desired block difficulty is found
 // Returns the hash and the nonce
 
 // In order to circumvent the overhead that Mutex-locking causes, each thread works on blocks of
@@ -234,12 +476,12 @@ pub fn find_hash(
     prev_hash: &str,
     data: &str,
     timestamp: i64,
-    difficulty: &str,
+    block_difficulty: &str,
     threads: usize,
-) -> (String, u32) {
-    let shared_max_nonce = Arc::new(Mutex::new(0));
+) -> (String, i64) {
+    let shared_max_nonce = Arc::new(Mutex::new(0 as i64));
     let hash = Arc::new(Mutex::new("".to_owned()));
-    let final_nonce = Arc::new(Mutex::new(0));
+    let final_nonce = Arc::new(Mutex::new(0 as i64));
 
     crossbeam::scope(|s| {
         for _ in 0..threads {
@@ -257,7 +499,7 @@ pub fn find_hash(
                 drop(shared_max_nonce);
                 for current_nonce in start_nonce..end_nonce {
                     let hash_string = hasher(prev_hash, data, timestamp, current_nonce);
-                    if !hash_string.starts_with(difficulty) {
+                    if !hash_string.starts_with(block_difficulty) {
                         continue;
                     }
                     if *final_nonce.lock().unwrap() == 0 {
@@ -280,7 +522,7 @@ pub fn find_hash(
     )
 }
 
-pub fn hasher(prev_hash: &str, data: &str, timestamp: i64, nonce: u32) -> String {
+pub fn hasher(prev_hash: &str, data: &str, timestamp: i64, nonce: i64) -> String {
     let json = serde_json::json!({
         "prev_hash": prev_hash,
         "data": data,
@@ -300,13 +542,13 @@ pub fn hasher(prev_hash: &str, data: &str, timestamp: i64, nonce: u32) -> String
     string
 }
 
-// Synchronous hashing function only used for benchmarking comparison, see benches/benchmark.rs
+// Synchronous hashing function only used for benchmarking, see benches/benchmark.rs
 pub fn find_hash_sync(
     prev_hash: &str,
     data: &str,
     timestamp: i64,
-    difficulty: &str,
-) -> (String, u32) {
+    block_difficulty: &str,
+) -> (String, i64) {
     let mut nonce = 0;
     loop {
         let json = serde_json::json!({
@@ -325,7 +567,7 @@ pub fn find_hash_sync(
             acc.push_str(&format!("{:X?}", el));
             acc
         });
-        if !string.starts_with(difficulty) {
+        if !string.starts_with(block_difficulty) {
             nonce += 1;
             continue;
         }

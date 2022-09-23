@@ -1,27 +1,36 @@
-# Rust Blockchain
-
-## 
-
-Open up at least two terminals and run `dasdasd`
-
-Nodes should auto connect within seconds after startup. Try disabling any active VPN connections if this is not the case.
+# Simple Rust Blockchain
+### The project I play around with when learning about new Rust concepts, patterns, etc.
+---
 
 
+## How to run
+
+Start the docker container in the root folder `docker-compose up -d`
+
+Open up at least two terminals and run `cargo run {DB_NAME}`, where DB_NAME is a unique database per instance. The database has to be manually created via pg admin (user:pw @ localhost:8042)
+
+Nodes should auto connect within a few seconds after startup. Try disconnecting any active VPN connections if this is not the case.
+
+When debugging in VS Code: Add a database name to the args array in the launch.json file
+
+## Tests
+
+Manually create a database named **blockchain_test** and run the test execution with `cargo test -- --test-threads=1`
+
+Since the tests operate on a real database instance, the **--test-threads=1** flag is essential so there are no conflicting database calls between tests.
 
 
 ## Inspired by
 
 https://github.com/zupzup/rust-blockchain-example
 
-## Resources
+## Some resources I used besides official docs
 
 ### libp2p
 
-https://github.com/libp2p/rust-libp2p
-
 https://github.com/Frederik-Baetens/libp2p-tokiochat/blob/main/src/main.rs
 
-### Kademlia
+### Kademlia (DHT)
 
 https://github.com/libp2p/specs/blob/master/kad-dht/README.md
 
@@ -30,6 +39,11 @@ https://medium.com/coinmonks/a-brief-overview-of-kademlia-and-its-use-in-various
 https://codethechange.stanford.edu/guides/guide_kademlia.html
 
 
+
+## Design decisions
+Since there is only one type (Block) stored to the DB, I decided not to use an ORM like [diesel](https://diesel.rs/) or [tokio-diesel](https://github.com/mehcode/tokio-diesel)
+
+The blockchain and p2p libs are completely de-coupled from each other, which might not be the smartest approach for this size/kind of app. My intention here was to play around with channels
 
 
 ## Linking
@@ -41,3 +55,13 @@ https://github.com/rui314/mold would be an even faster alternative (available fo
 ## Mining
 
 The hashing algorithm is executed in X threads in parallel (where X = available cores of the system). Benchmark tests that compare different numbers of threads and workloads per thread can be found under **benches/benchmark.rs**
+
+
+## Possible improvements (that I might or might not tackle in the future)
+
+- [ ] store multiple messages per block and hash them into a merkle tree and store the merkle root in the block header (as Bitcoin does with transactions)
+- [ ] mining: change nonce to u32 and add timestamp-refreshing each time the u32 limit (4294967295) has been unsuccessfully reached while hashing
+- [ ] replace MDNS with Kademlia + Identity for peer discovery
+- [ ] sync blockchain in chunks
+- [ ] sync chains via a dedicated topic that is created for each sync that only the sender(s) and receiver are subscribed to
+- [ ] add more tests
