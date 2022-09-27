@@ -2,6 +2,8 @@
 ### The project I play around with when learning about new Rust concepts, patterns, etc.
 ---
 
+## Current state
+Auto-connecting nodes via libp2p (mDNS and Gossipsub), syncing chains on start-up & re-connect, mining blocks and broadcasting them, chain & block validation, chain persistence through Postgres
 
 ## How to run
 
@@ -13,12 +15,13 @@ Nodes should auto connect within a few seconds after startup. Try disconnecting 
 
 When debugging in VS Code: Add a database name to the args array in the launch.json file
 
+Available commands will be shown in the terminal as soon as the app starts (e.g. block mine {BLOCK_DATA}, block validate {BLOCK_HASH}).
+
 ## Tests
 
 Manually create a database named **blockchain_test** and run the test execution with `cargo test -- --test-threads=1`
 
 Since the tests operate on a real database instance, the **--test-threads=1** flag is essential so there are no conflicting database calls between tests.
-
 
 ## Inspired by
 
@@ -65,3 +68,7 @@ The hashing algorithm is executed in X threads in parallel (where X = available 
 - [ ] sync blockchain in chunks
 - [ ] sync chains via a dedicated topic that is created for each sync that only the sender(s) and receiver are subscribed to
 - [ ] add more tests
+- [ ] set logging level on start-up
+- [ ] add shell script that creates a database on start-up 
+- [ ] validate a node after mining before adding it
+- [ ] stop mining if a new block is added during the process
