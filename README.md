@@ -2,6 +2,8 @@
 ### The project I play around with when learning about new Rust concepts, patterns, etc.
 ---
 
+## Current state
+Auto-connecting nodes via libp2p (mDNS and Gossipsub), syncing chains on start-up & re-connect, mining blocks and broadcasting them, chain & block validation, chain persistence through Postgres
 
 ## How to run
 
@@ -12,6 +14,8 @@ Open up at least two terminals and run `cargo run {DB_NAME}`, where DB_NAME is a
 Nodes should auto connect within a few seconds after startup. Try disconnecting any active VPN connections if this is not the case.
 
 When debugging in VS Code: Add a database name to the args array in the launch.json file
+
+Available commands will be shown in the terminal as soon as the app starts (e.g. block mine {BLOCK_DATA}, block validate {BLOCK_HASH}).
 
 ## Tests
 
@@ -45,6 +49,10 @@ The hashing algorithm is executed in X threads in parallel (where X = available 
 - [ ] sync blockchain in chunks
 - [ ] sync chains via a dedicated topic that is created for each sync that only the sender(s) and receiver are subscribed to
 - [ ] add more tests
+- [ ] set logging level on start-up
+- [ ] add shell script that creates a database on start-up 
+- [ ] validate a node after mining before adding it
+- [ ] stop mining if a new block is added during the process
 
 ## Inspired by
 
@@ -63,3 +71,4 @@ https://github.com/libp2p/specs/blob/master/kad-dht/README.md
 https://medium.com/coinmonks/a-brief-overview-of-kademlia-and-its-use-in-various-decentralized-platforms-da08a7f72b8f
 
 https://codethechange.stanford.edu/guides/guide_kademlia.html
+
