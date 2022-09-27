@@ -23,25 +23,6 @@ Manually create a database named **blockchain_test** and run the test execution 
 
 Since the tests operate on a real database instance, the **--test-threads=1** flag is essential so there are no conflicting database calls between tests.
 
-## Inspired by
-
-https://github.com/zupzup/rust-blockchain-example
-
-## Some resources I used besides official docs
-
-### libp2p
-
-https://github.com/Frederik-Baetens/libp2p-tokiochat/blob/main/src/main.rs
-
-### Kademlia (DHT)
-
-https://github.com/libp2p/specs/blob/master/kad-dht/README.md
-
-https://medium.com/coinmonks/a-brief-overview-of-kademlia-and-its-use-in-various-decentralized-platforms-da08a7f72b8f
-
-https://codethechange.stanford.edu/guides/guide_kademlia.html
-
-
 
 ## Design decisions
 Since there is only one type (Block) stored to the DB, I decided not to use an ORM like [diesel](https://diesel.rs/) or [tokio-diesel](https://github.com/mehcode/tokio-diesel)
@@ -72,3 +53,22 @@ The hashing algorithm is executed in X threads in parallel (where X = available 
 - [ ] add shell script that creates a database on start-up 
 - [ ] validate a node after mining before adding it
 - [ ] stop mining if a new block is added during the process
+
+## Inspired by
+
+https://github.com/zupzup/rust-blockchain-example
+
+## Some resources I used besides official docs
+
+### libp2p
+
+https://github.com/Frederik-Baetens/libp2p-tokiochat/blob/main/src/main.rs
+
+### Kademlia (DHT)
+
+https://github.com/libp2p/specs/blob/master/kad-dht/README.md
+
+https://medium.com/coinmonks/a-brief-overview-of-kademlia-and-its-use-in-various-decentralized-platforms-da08a7f72b8f
+
+https://codethechange.stanford.edu/guides/guide_kademlia.html
+
